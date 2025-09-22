@@ -66,7 +66,7 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // Low-order bits of our own PC. Combine with ftq[ftq_idx] to get PC.
   // Aligned to a cache-line size, as that is the greater fetch granularity.
   // TODO: Shouldn't this be aligned to fetch-width size?
-  val pc_lob           = UInt(log2Ceil(icBlockBytes).W)
+  val pc_lob           = UInt(log2Ceil(icBlockBytes + icBankBytes).W)
 
   // Was this a branch that was predicted taken?
   val taken            = Bool()

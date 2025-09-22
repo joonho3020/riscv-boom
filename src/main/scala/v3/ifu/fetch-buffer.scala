@@ -87,25 +87,35 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
   val in_mask = Wire(Vec(fetchWidth, Bool()))
   val in_uops = Wire(Vec(fetchWidth, new MicroOp()))
 
+  dontTouch(in_uops)
+  dontTouch(in_mask)
+
   // Step 1: Convert FetchPacket into a vector of MicroOps.
   for (b <- 0 until nBanks) {
     for (w <- 0 until bankWidth) {
       val i = (b * bankWidth) + w
 
       val pc = (bankAlign(io.enq.bits.pc) + (i << 1).U)
+      val same_cl = sameCacheline(pc, io.enq.bits.pc)
+
+      dontTouch(pc)
+      dontTouch(same_cl)
 
       in_uops(i)                := DontCare
       in_mask(i)                := io.enq.valid && io.enq.bits.mask(i)
       in_uops(i).edge_inst      := false.B
       in_uops(i).debug_pc       := pc
-      in_uops(i).pc_lob         := pc
+      in_uops(i).pc_lob         := pc(blockOffBits-1, 0) + Mux(!same_cl && io.enq.bits.mask(i), icBlockBytes.U, 0.U)
 
       in_uops(i).is_sfb         := io.enq.bits.sfbs(i) || io.enq.bits.shadowed_mask(i)
 
       if (w == 0) {
         when (io.enq.bits.edge_inst(b)) {
+          val pc_edge = bankAlign(io.enq.bits.pc) + (b * bankBytes).U
+          dontTouch(pc_edge)
+
           in_uops(i).debug_pc  := bankAlign(io.enq.bits.pc) + (b * bankBytes).U - 2.U
-          in_uops(i).pc_lob    := bankAlign(io.enq.bits.pc) + (b * bankBytes).U
+          in_uops(i).pc_lob    := pc_edge(blockOffBits-1, 0) + Mux(!same_cl && io.enq.bits.mask(i), icBlockBytes.U, 0.U)
           in_uops(i).edge_inst := true.B
         }
       }

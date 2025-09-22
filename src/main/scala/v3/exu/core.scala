@@ -423,7 +423,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     io.ifu.redirect_ftq_idx := RegNext(rob.io.flush.bits.ftq_idx)
   } .elsewhen (brupdate.b2.mispredict && !RegNext(rob.io.flush.valid)) {
     val block_pc = AlignPCToBoundary(io.ifu.get_pc(1).pc, icBlockBytes)
-    val uop_maybe_pc = block_pc | brupdate.b2.uop.pc_lob
+    val uop_maybe_pc = block_pc + brupdate.b2.uop.pc_lob
     val npc = uop_maybe_pc + Mux(brupdate.b2.uop.is_rvc || brupdate.b2.uop.edge_inst, 2.U, 4.U)
     val jal_br_target = Wire(UInt(vaddrBitsExtended.W))
     jal_br_target := (uop_maybe_pc.asSInt + brupdate.b2.target_offset +

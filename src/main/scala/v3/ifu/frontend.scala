@@ -35,6 +35,8 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   val xcpt = new FrontendExceptions
   val ghist = new GlobalHistory
 
+  val mask_upper = Bool()
+
   // fsrc provides the prediction FROM a branch in this packet
   // tsrc provides the prediction TO this packet
   val fsrc = UInt(BSRC_SZ.W)
@@ -161,14 +163,24 @@ trait HasBoomFrontendParameters extends HasL1ICacheParameters
 
   def fetchIdx(addr: UInt) = addr >> log2Ceil(fetchBytes)
 
+
+  def pageCrossing(addr: UInt, nxt_addr: UInt): Bool = {
+    (addr >> pgIdxBits) =/= (nxt_addr >> pgIdxBits)
+  }
+
   def nextBank(addr: UInt) = bankAlign(addr) + bankBytes.U
-  def nextFetch(addr: UInt) = {
+  def nextFetch(addr: UInt, mask_upper: Bool) = {
     if (nBanks == 1) {
       bankAlign(addr) + bankBytes.U
     } else {
       require(nBanks == 2)
-      bankAlign(addr) + Mux(mayNotBeDualBanked(addr), bankBytes.U, fetchBytes.U)
+// bankAlign(addr) + Mux(mayNotBeDualBanked(addr), bankBytes.U, fetchBytes.U)
+      bankAlign(addr) + Mux(pageCrossing(addr, nextBank(addr)) || mask_upper, bankBytes.U, fetchBytes.U)
     }
+  }
+
+  def sameCacheline(a: UInt, b: UInt): Bool = {
+    (a >> blockOffBits) === (b >> blockOffBits)
   }
 
   def fetchMask(addr: UInt) = {
@@ -182,12 +194,28 @@ trait HasBoomFrontendParameters extends HasL1ICacheParameters
     }
   }
 
-  def bankMask(addr: UInt) = {
+  def fetchMaskLineCross(addr: UInt, mask_upper: Bool) = {
+    val idx = addr.extract(log2Ceil(fetchWidth)+log2Ceil(coreInstBytes)-1, log2Ceil(coreInstBytes))
+    if (nBanks == 1) {
+      ((1 << fetchWidth)-1).U << idx
+    } else {
+      val shamt = idx.extract(log2Ceil(fetchWidth)-2, 0)
+      val full_mask = Fill(fetchWidth, 1.U)
+      val half_mask = Fill(fetchWidth/2, 1.U)
+      val end_mask = Mux(isLastBankInBlock(bankAlign(addr)),
+        Mux(mask_upper, half_mask, full_mask),
+        full_mask)
+      ((1 << fetchWidth)-1).U << shamt & end_mask
+    }
+  }
+
+  def bankMask(addr: UInt, mask_upper: Bool) = {
     val idx = addr.extract(log2Ceil(fetchWidth)+log2Ceil(coreInstBytes)-1, log2Ceil(coreInstBytes))
     if (nBanks == 1) {
       1.U(1.W)
     } else {
-      Mux(mayNotBeDualBanked(addr), 1.U(2.W), 3.U(2.W))
+// Mux(mayNotBeDualBanked(addr), 1.U(2.W), 3.U(2.W))
+      Mux(mask_upper, 1.U(2.W), 3.U(2.W))
     }
   }
 }
@@ -412,7 +440,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f1_targs = s1_bpd_resp.preds.map(_.predicted_pc.bits)
   val f1_predicted_target = Mux(f1_do_redirect,
                                 f1_targs(f1_redirect_idx),
-                                nextFetch(s1_vpc))
+                                nextFetch(s1_vpc, false.B))
 
   val f1_predicted_ghist = s1_ghist.update(
     s1_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f1_mask,
@@ -451,6 +479,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s2_xcpt = s2_valid && (s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay
   val f3_ready = Wire(Bool())
 
+  val f2_mask_upper = icache.io.resp.bits.mask_upper
+
   icache.io.s2_kill := s2_xcpt
 
   val f2_bpd_resp = bpd.io.resp.f2
@@ -465,7 +495,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f2_do_redirect = f2_redirects.reduce(_||_) && useBPD.B
   val f2_predicted_target = Mux(f2_do_redirect,
                                 f2_targs(f2_redirect_idx),
-                                nextFetch(s2_vpc))
+                                nextFetch(s2_vpc, f2_mask_upper))
   val f2_predicted_ghist = s2_ghist.update(
     f2_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f2_mask,
     f2_bpd_resp.preds(f2_redirect_idx).taken && f2_do_redirect,
@@ -531,10 +561,16 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.pc := s2_vpc
   f3.io.enq.bits.data  := Mux(s2_xcpt, 0.U, icache.io.resp.bits.data)
   f3.io.enq.bits.ghist := s2_ghist
-  f3.io.enq.bits.mask := fetchMask(s2_vpc)
+  if (boomParams.icacheFetchAcrossLines) {
+    require(nBanks == 2)
+    f3.io.enq.bits.mask := fetchMaskLineCross(s2_vpc, icache.io.resp.bits.mask_upper)
+  } else {
+    f3.io.enq.bits.mask := fetchMask(s2_vpc)
+  }
   f3.io.enq.bits.xcpt := s2_tlb_resp
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
+  f3.io.enq.bits.mask_upper := icache.io.resp.bits.mask_upper
 
   // RAS takes a cycle to read
   val ras_read_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
@@ -556,8 +592,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_bpd_resp.io.deq.ready := f4_ready
 
 
+  val f3_mask_upper = RegNext(f2_mask_upper)
   val f3_imemresp     = f3.io.deq.bits
-  val f3_bank_mask    = bankMask(f3_imemresp.pc)
+  val f3_bank_mask    = bankMask(f3_imemresp.pc, f3_imemresp.mask_upper)
   val f3_data         = f3_imemresp.data
   val f3_aligned_pc   = bankAlign(f3_imemresp.pc)
   val f3_is_last_bank_in_block = isLastBankInBlock(f3_aligned_pc)
@@ -582,6 +619,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.fsrc := f3_imemresp.fsrc
   f3_fetch_bundle.tsrc := f3_imemresp.tsrc
   f3_fetch_bundle.shadowed_mask := f3_shadowed_mask
+
+  dontTouch(f3_fetch_bundle)
 
   // Tracks trailing 16b of previous fetch packet
   val f3_prev_half    = Reg(UInt(16.W))
@@ -622,9 +661,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         val bpd_decoder0 = Module(new BranchDecode)
         bpd_decoder0.io.inst := exp_inst0
         bpd_decoder0.io.pc   := pc0
+        bpd_decoder0.suggestName(s"bpd_decoder0_${i}")
         val bpd_decoder1 = Module(new BranchDecode)
         bpd_decoder1.io.inst := exp_inst1
         bpd_decoder1.io.pc   := pc1
+        bpd_decoder1.suggestName(s"bpd_decoder1_${i}")
 
         when (bank_prev_is_half) {
           bank_insts(w)                := inst0
@@ -661,6 +702,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         val exp_inst = ExpandRVC(inst)
         val pc = f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U
         val bpd_decoder = Module(new BranchDecode)
+        bpd_decoder.suggestName(s"bpd_decoder_${i}")
         bpd_decoder.io.inst := exp_inst
         bpd_decoder.io.pc   := pc
 
@@ -781,12 +823,23 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
-  val f3_predicted_target = Mux(f3_redirects.reduce(_||_),
+
+  val f3_redirects_true = f3_redirects.reduce(_||_)
+  val f3_next_fetch = nextFetch(f3_fetch_bundle.pc, f3_mask_upper)
+  val f3_targs_idx = PriorityEncoder(f3_redirects)
+  dontTouch(f3_redirects_true)
+  dontTouch(f3_next_fetch)
+  dontTouch(f3_targs_idx)
+  dontTouch(f3_targs)
+  dontTouch(f3_fetch_bundle.cfi_is_ret)
+  dontTouch(f3_fetch_bundle.pc)
+
+  val f3_predicted_target = Mux(f3_redirects_true,
     Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B,
       ras.io.read_addr,
       f3_targs(PriorityEncoder(f3_redirects))
     ),
-    nextFetch(f3_fetch_bundle.pc)
+    f3_next_fetch
   )
 
   f3_fetch_bundle.next_pc       := f3_predicted_target

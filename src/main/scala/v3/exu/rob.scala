@@ -142,7 +142,7 @@ class CommitExceptionSignals(implicit p: Parameters) extends BoomBundle
   val ftq_idx    = UInt(log2Ceil(ftqSz).W)
   val edge_inst  = Bool()
   val is_rvc     = Bool()
-  val pc_lob     = UInt(log2Ceil(icBlockBytes).W)
+  val pc_lob     = UInt(log2Ceil(icBlockBytes + icBankBytes).W)
   val cause      = UInt(xLen.W)
   val badvaddr   = UInt(xLen.W)
 // The ROB needs to tell the FTQ if there's a pipeline flush (and what type)
@@ -653,7 +653,7 @@ class Rob(
       // if no exception yet, dispatch exception wins
       r_xcpt_val      := true.B
       next_xcpt_uop   := io.enq_uops(idx)
-      r_xcpt_badvaddr := AlignPCToBoundary(io.xcpt_fetch_pc, icBlockBytes) | io.enq_uops(idx).pc_lob
+      r_xcpt_badvaddr := AlignPCToBoundary(io.xcpt_fetch_pc, icBlockBytes) + io.enq_uops(idx).pc_lob
 
     }
   }

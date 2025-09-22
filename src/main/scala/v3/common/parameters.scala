@@ -56,6 +56,8 @@ case class BoomCoreParams(
   numDCacheBanks: Int = 1,
   nPMPs: Int = 8,
   enableICacheDelay: Boolean = false,
+  icacheSinglePorted: Boolean = true,
+  icacheFetchAcrossLines: Boolean = false,
 
   /* branch prediction */
   enableBranchPrediction: Boolean = true,
@@ -232,6 +234,8 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val dcacheParams: DCacheParams = tileParams.dcache.get
   val icacheParams: ICacheParams = tileParams.icache.get
   val icBlockBytes = icacheParams.blockBytes
+  val icBanks = if (icacheParams.fetchBytes <= 8) 1 else 2
+  val icBankBytes = icacheParams.fetchBytes / icBanks
 
   require(icacheParams.nSets <= 64, "Handling aliases in the ICache is buggy.")
 

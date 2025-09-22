@@ -174,7 +174,7 @@ class WithNMediumBooms(n: Int = 1) extends Config(
 /**
  * 3-wide BOOM. Try to match the Cortex-A15.
  */
-class WithNLargeBooms(n: Int = 1) extends Config(
+class WithNLargeBooms(n: Int = 1, fetchAcrossLines: Boolean = false) extends Config(
   new WithTAGELBPD ++ // Default to TAGE-L BPD
   new Config((site, here, up) => {
     case TilesLocated(InSubsystem) => {
@@ -197,6 +197,7 @@ class WithNLargeBooms(n: Int = 1) extends Config(
               numStqEntries = 24,
               maxBrCount = 16,
               numFetchBufferEntries = 24,
+              icacheFetchAcrossLines = fetchAcrossLines,
               ftq = FtqParameters(nEntries=32),
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))
             ),
@@ -220,7 +221,7 @@ class WithNLargeBooms(n: Int = 1) extends Config(
 /**
  * 4-wide BOOM.
  */
-class WithNMegaBooms(n: Int = 1) extends Config(
+class WithNMegaBooms(n: Int = 1, fetchAcrossLines: Boolean = false) extends Config(
   new WithTAGELBPD ++ // Default to TAGE-L BPD
   new Config((site, here, up) => {
     case TilesLocated(InSubsystem) => {
@@ -243,6 +244,7 @@ class WithNMegaBooms(n: Int = 1) extends Config(
               numStqEntries = 32,
               maxBrCount = 20,
               numFetchBufferEntries = 32,
+              icacheFetchAcrossLines = fetchAcrossLines,
               enablePrefetching = true,
               ftq = FtqParameters(nEntries=40),
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))

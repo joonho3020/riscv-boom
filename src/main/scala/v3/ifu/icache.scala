@@ -60,6 +60,7 @@ class ICacheResp(val outer: ICache) extends Bundle
   val data = UInt((outer.icacheParams.fetchBytes*8).W)
   val replay = Bool()
   val ae = Bool()
+  val mask_upper = Bool()
 }
 
 /**
@@ -104,6 +105,8 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   with HasBoomFrontendParameters
 {
   val enableICacheDelay = tileParams.core.asInstanceOf[BoomCoreParams].enableICacheDelay
+  val icacheFetchAcrossLines = tileParams.core.asInstanceOf[BoomCoreParams].icacheFetchAcrossLines
+
   val io = IO(new ICacheBundle(outer))
   val (tl_out, edge_out) = outer.masterNode.out(0)
 
@@ -120,7 +123,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   // cycle).
   val refillsToOneBank = (2*tl_out.d.bits.data.getWidth == wordBits)
 
-
+  require(!icacheFetchAcrossLines || (!refillsToOneBank && nBanks == 2))
 
   val s0_valid = io.req.fire
   val s0_vaddr = io.req.bits.addr
@@ -131,6 +134,18 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s2_valid = RegNext(s1_valid && !io.s1_kill)
   val s2_hit = RegNext(s1_hit)
 
+  // Optional: look ahead to next bank's tag to enable across-line fetch masking
+  val s0_nxt_lookup = WireInit(false.B)
+  val s1_nxt_lookup = RegNext(s0_nxt_lookup)
+  val s2_nxt_lookup = RegNext(s1_nxt_lookup)
+  val s1_nxt_tag_hit = Wire(Vec(nWays, Bool()))
+  val s1_nxt_hit = s1_nxt_tag_hit.reduce(_||_)
+  val s2_nxt_hit = RegNext(s1_nxt_hit)
+
+  dontTouch(s1_nxt_lookup)
+  dontTouch(s2_nxt_lookup)
+  dontTouch(s1_nxt_tag_hit)
+  dontTouch(s1_nxt_hit)
 
   val invalidated = Reg(Bool())
   val refill_valid = RegInit(false.B)
@@ -152,6 +167,24 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
   val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
   val tag_rdata = tag_array.read(s0_vaddr(untagBits-1, blockOffBits), !refill_done && s0_valid)
+  val tag_rdata_nxt = Wire(Vec(nWays, UInt(tagBits.W)))
+  tag_rdata_nxt := DontCare
+  dontTouch(tag_rdata_nxt)
+
+  if (icacheFetchAcrossLines) {
+    val s0_nxt_vaddr = nextBank(s0_vaddr)
+    dontTouch(s0_nxt_vaddr)
+
+    val is_page_crossing = pageCrossing(s0_vaddr, s0_nxt_vaddr)
+    dontTouch(is_page_crossing)
+
+    when (isLastBankInBlock(s0_vaddr) && !pageCrossing(s0_vaddr, s0_nxt_vaddr)) {
+      tag_rdata_nxt := tag_array.read(s0_nxt_vaddr(untagBits-1, blockOffBits), !refill_done && s0_valid)
+      s0_nxt_lookup := true.B
+    } .otherwise {
+      s0_nxt_lookup := false.B
+    }
+  }
   when (refill_done) {
     tag_array.write(refill_idx, VecInit(Seq.fill(nWays)(refill_tag)), Seq.tabulate(nWays)(repl_way === _.U))
   }
@@ -175,6 +208,14 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     val s1_vb = vb_array(Cat(i.U, s1_idx))
     val tag = tag_rdata(i)
     s1_tag_hit(i) := s1_vb && tag === s1_tag
+
+    // Next-bank tag hit detection (for mask_upper computation)
+    val s1_nxt_paddr = nextBank(io.s1_paddr)
+    val s1_nxt_idx = s1_nxt_paddr(untagBits-1,blockOffBits)
+    val s1_nxt_tag = s1_nxt_paddr(tagBits+untagBits-1,untagBits)
+    val s1_nxt_vb = vb_array(Cat(i.U, s1_nxt_idx))
+    val nxt_tag = tag_rdata_nxt(i)
+    s1_nxt_tag_hit(i) := s1_nxt_vb && nxt_tag === s1_nxt_tag
   }
   assert(PopCount(s1_tag_hit) <= 1.U || !s1_valid)
 
@@ -253,6 +294,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
     s1_bankid := RegNext(bank(s0_vaddr))
 
+    val s0_nxt_vaddr = nextBank(s0_vaddr)
     for (i <- 0 until nWays) {
       val s0_ren = s0_valid
       val wen = (refill_one_beat && !invalidated)&& repl_way === i.U
@@ -276,18 +318,32 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
           dataArraysB1(i).write(mem_idx1, tl_out.d.bits.data)
         }
       } else {
-        // write a refill beat across both banks.
-        mem_idx0 =
-          Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
-          b0Row(s0_vaddr))
-        mem_idx1 =
-          Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
-          b1Row(s0_vaddr))
-
-        when (wen) {
-          val data = tl_out.d.bits.data
-          dataArraysB0(i).write(mem_idx0, data(wordBits/2-1, 0))
-          dataArraysB1(i).write(mem_idx1, data(wordBits-1, wordBits/2))
+        if (icacheFetchAcrossLines) {
+          // write a refill beat across both banks.
+          mem_idx0 =
+            Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
+              Mux(s0_nxt_lookup, b1Row(s0_nxt_vaddr), b0Row(s0_vaddr)))
+          mem_idx1 =
+            Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
+              Mux(s0_nxt_lookup, b1Row(s0_vaddr), b1Row(s0_vaddr)))
+          when (wen) {
+            val data = tl_out.d.bits.data
+            dataArraysB0(i).write(mem_idx0, data(wordBits/2-1, 0))
+            dataArraysB1(i).write(mem_idx1, data(wordBits-1, wordBits/2))
+          }
+        } else {
+          // write a refill beat across both banks.
+          mem_idx0 =
+            Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
+              b0Row(s0_vaddr))
+          mem_idx1 =
+            Mux(refill_one_beat, (refill_idx << log2Ceil(refillCycles)) | refill_cnt,
+              b1Row(s0_vaddr))
+          when (wen) {
+            val data = tl_out.d.bits.data
+            dataArraysB0(i).write(mem_idx0, data(wordBits/2-1, 0))
+            dataArraysB1(i).write(mem_idx1, data(wordBits-1, wordBits/2))
+          }
         }
       }
       if (enableICacheDelay) {
@@ -309,11 +365,40 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s2_bank0_data = s2_way_mux(sz/2-1,0)
   val s2_bank1_data = s2_way_mux(sz-1,sz/2)
 
+  val s2_nxt_tag_hit = RegNext(s1_nxt_tag_hit)
+  val s2_nxt_way_mux = Mux1H(s2_nxt_tag_hit, s2_dout)
+  val s2_nxt_bank0_data = s2_nxt_way_mux(sz/2-1,0)
+  val s2_nxt_bank1_data = s2_nxt_way_mux(sz-1,sz/2)
+
+  dontTouch(s2_hit_way)
+  dontTouch(s2_nxt_hit)
+  dontTouch(s2_nxt_lookup)
+  dontTouch(s2_bank0_data)
+  dontTouch(s2_bank1_data)
+  dontTouch(s2_nxt_tag_hit)
+  dontTouch(s2_nxt_way_mux)
+  dontTouch(s2_nxt_bank0_data)
+  dontTouch(s2_nxt_bank1_data)
+
   val s2_data =
     if (nBanks == 2) {
-      Mux(s2_bankid,
-        Cat(s2_bank0_data, s2_bank1_data),
-        Cat(s2_bank1_data, s2_bank0_data))
+      if (icacheFetchAcrossLines) {
+        val data = Wire(UInt(wordBits.W))
+        when (s2_nxt_lookup && s2_nxt_hit) {
+            // CL    | Next CL
+            // bank1 | bank0
+            data := Cat(s2_nxt_bank0_data, s2_bank1_data)
+        } .otherwise {
+          data := Mux(s2_bankid,
+            Cat(s2_bank0_data, s2_bank1_data),
+            Cat(s2_bank1_data, s2_bank0_data))
+        }
+        data
+      } else {
+        Mux(s2_bankid,
+          Cat(s2_bank0_data, s2_bank1_data),
+          Cat(s2_bank1_data, s2_bank0_data))
+      }
     } else {
       s2_unbanked_data
     }
@@ -322,6 +407,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.resp.bits.replay := DontCare
   io.resp.bits.data := s2_data
   io.resp.valid := s2_valid && s2_hit
+  io.resp.bits.mask_upper := Mux(s2_nxt_lookup, !s2_nxt_hit, false.B)
 
   tl_out.a.valid := s2_miss && !refill_valid && !io.s2_kill
   tl_out.a.bits := edge_out.Get(

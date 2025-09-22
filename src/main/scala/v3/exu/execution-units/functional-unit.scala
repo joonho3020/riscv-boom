@@ -307,7 +307,7 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   if (isJmpUnit) {
     // Get the uop PC for jumps
     val block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
-    val uop_pc = (block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
+    val uop_pc = (block_pc + uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
 
     op1_data = Mux(uop.ctrl.op1_sel.asUInt === OP1_RS1 , io.req.bits.rs1_data,
                Mux(uop.ctrl.op1_sel.asUInt === OP1_PC  , Sext(uop_pc, xLen),
